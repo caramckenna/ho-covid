@@ -1,0 +1,945 @@
+---
+title: Hospital-Acquired SARS-CoV-2
+subtitle: Exact Match, Followed by Propensity Score Matching Analysis, Adjusted Relative Risk Outcomes
+author: 
+date: 
+output:
+  word_document:
+    reference_docx: word_styles.docx
+    df_print: kable
+  html_document: default
+  pdf_document: default
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = 'ho_COVID_vax_status_RR_adjust_2024-05-22.docx',
+      envir = globalenv()
+    )
+  })
+---
+
+```{r,include=FALSE}
+library(tidyverse)
+library(survival)
+library(ipw)
+library(optmatch)
+library(lubridate)
+library(MatchIt)
+library(naniar)
+library(lmtest)
+library(RItools)
+library(sandwich)
+library(broom)
+library(knitr)
+library(cobalt)
+library(quantreg)
+
+filesfx <- "vax_status_2024-05-08"
+outfilesfx <- "vax_status_RR_adjust_2024-05-22"
+
+loc <- "/data/tide/projects/ho-covid/annals_resubmission/add_addtl_vars_dr5_sdm/sensitivity_analyses/vax_status"
+
+dataLoc <- paste0(loc,"/data")
+outLoc <- paste0(loc,"/output")
+
+
+# setwd("/external/BWH-ICRESEARCH/Projects/Hospital Onset COVID")
+covid_data_simulation <- readRDS(file.path(dataLoc,paste0("covid_data_simulation_",filesfx,".Rds")))
+matchedF <- paste0("covid_data_simulation_matched_",filesfx,".Rds")
+
+new_events <- readRDS(file.path(dataLoc,"ho_covid_after_match_new_events_vax_status_2024-05-22.Rds")) %>% select(-case,-cov_grp)
+
+# after_match_new_events <- new_events %>% 
+#   select(hospID,matchid,hospitalfree30day)
+```
+  
+## Inclusion Criteria
+Patients were included in analysis if they met **all** of the following criteria:
+  
+- Admission to BWH, MGH, BWF, NSMC, NWH on or after December 1, 2020 through April 30, 2023
+- Age >= 18
+- Hospital length of stay >= 5 days
+
+## Exclusions
+Patients were excluded from analysis if they met **any** of the following criteria:
+  
+- COVID flag active on hospital day 1 - 4
+
+
+## Case Definition
+Cases were defined as:
+  
+- Activation of COVID-19 flag on hospital day 5 or greater
+- COVID-19 flag remains active for >= 4 days (including post-discharge)
+
+
+## Study Population
+```{r}
+# N Hospitalizations
+nrow(distinct(covid_data_simulation,hospID))
+
+# Min Admit Date
+min(covid_data_simulation$admitDT)
+
+# Max Admit Date
+max(covid_data_simulation$admitDT)
+
+# N Hospital Days
+nrow(covid_data_simulation)
+
+# N Cases
+nrow(covid_data_simulation %>% filter(case==1))
+```
+
+
+## Matching
+Cases are matched to controls in three steps.
+
+1. Exact match on:
+
+- Hospital
+- Service group on match day minus 2
+- ICU status on match day minus 2
+
+2. Caliper match on:
+- LOS for controls greater than or equal to match day for case
+- Admit date within 90 days
+- Propensity score standardized difference  < 0.2
+
+
+```{r}
+covid_data_simulation_matched <- readRDS(file.path(dataLoc,matchedF)) %>%
+  left_join(.,new_events,by=c("hospID","matchid")) %>% 
+   mutate(ttmatch_days= as.numeric((date-admitDT)+1),
+         matchtodischarge_days= as.numeric(dischargeDT-date))
+
+# N matches
+nrow(distinct(covid_data_simulation_matched,matchid))
+```
+
+## Balance Results Using Cobalt 
+### Pre-Omicron
+```{r}
+pre_omicron <- covid_data_simulation_matched %>% filter(cov_grp==0)
+
+covs <- pre_omicron %>% 
+  select(encAge,gender,raceEthnicity,dischargeLocation2,encDeathDerived,
+         dischargeDispositionGroup2,prevDischarge90Days,LOS,facility_admission,
+         starts_with("elix_"),
+         maxTemp,medRR,medSBP,medDBP,maxALT,maxTBILI,minALB,minSODIUM,maxCREAT,
+         minPLT,maxWBC,minHCT,maxGLU,ICUalgo,serviceGroup2,ttmatch_days,matchtodischarge_days,
+         covVaxEver,covVaxLast4months,covVaxCumSum)
+
+bal.tab(case ~ covs, data = pre_omicron, binary = "std", continuous = "std")
+```
+
+### Omicron
+```{r}
+post_omicron <- covid_data_simulation_matched %>% filter(cov_grp==1)
+
+covs <- post_omicron  %>% 
+  select(encAge,gender,raceEthnicity,dischargeLocation2,encDeathDerived,
+         dischargeDispositionGroup2,prevDischarge90Days,LOS,facility_admission,
+         starts_with("elix_"),
+         maxTemp,medRR,medSBP,medDBP,maxALT,maxTBILI,minALB,minSODIUM,maxCREAT,
+         minPLT,maxWBC,minHCT,maxGLU,ICUalgo,serviceGroup2,ttmatch_days,matchtodischarge_days,
+         covVaxEver,covVaxLast4months,covVaxCumSum)
+
+bal.tab(case ~ covs, data = post_omicron, binary = "std", continuous = "std")
+```
+
+
+## Outcomes
+```{r,include=FALSE}
+# make a copy of matched data 
+covid_data_simulation_matched2 <- covid_data_simulation_matched %>% 
+  group_by(matches) %>% 
+  mutate(hospitalDay_normalized = hospitalDay-min(hospitalDay), 
+         hospitalDay0_normalized = hospitalDay0-min(hospitalDay),
+         sex_male = if_else(gender=="Male",1,0))
+
+nrow(distinct(covid_data_simulation_matched2,matchid))
+nrow(distinct(covid_data_simulation_matched2,matches))
+```
+
+
+```{r}
+##############
+#UPDATED: Tom#
+coefSmry.lm <- function(in_testcoef,tp,eventLBL){
+  
+  if (tp=="pre-omicron"){
+    out <- data.frame(event=eventLBL,
+                      po_estimate=in_testcoef[2,1], 
+                      po_conf_low=in_testcoef[2,5],
+                      po_conf_high=in_testcoef[2,6],
+                      po_pvalue= in_testcoef[2,4],
+                      metric = "Difference")
+} else {
+    out <- data.frame(event=eventLBL,
+                      o_estimate=in_testcoef[2,1], 
+                      o_conf_low=in_testcoef[2,5],
+                      o_conf_high=in_testcoef[2,6],
+                      o_pvalue= in_testcoef[2,4],
+                      metric = "Difference")
+}
+  return(out)
+}
+
+# 5/8/2024 Adding new function for median differences
+coefSmry.lm.med <- function(in_testcoef,tp,eventLBL){
+  
+  if (tp=="pre-omicron"){
+    out <- data.frame(event=eventLBL,
+                      po_estimate=in_testcoef[2,1], 
+                      po_conf_low=in_testcoef[2,5],
+                      po_conf_high=in_testcoef[2,6],
+                      po_pvalue= in_testcoef[2,4],
+                      metric = "Difference")
+} else {
+    out <- data.frame(event=eventLBL,
+                      o_estimate=in_testcoef[2,1], 
+                      o_conf_low=in_testcoef[2,5],
+                      o_conf_high=in_testcoef[2,6],
+                      o_pvalue= in_testcoef[2,4],
+                      metric = "Difference")
+}
+  return(out)
+}
+
+##############
+
+##############
+#UPDATED: Tom#
+coefSmry.glmbinomial <- function(in_testcoef,tp,eventLBL){
+  
+  if (tp=="pre-omicron"){
+    out <- data.frame(event=eventLBL,
+                      po_estimate=exp(in_testcoef[2,1]), 
+                      po_conf_low=exp(in_testcoef[2,5]),
+                      po_conf_high=exp(in_testcoef[2,6]),
+                      po_pvalue= in_testcoef[2,4],
+                      metric = "Relative Risk")
+  } else {
+    out <- data.frame(event=eventLBL,
+                      o_estimate=exp(in_testcoef[2,1]), 
+                      o_conf_low=exp(in_testcoef[2,5]),
+                      o_conf_high=exp(in_testcoef[2,6]),
+                      o_pvalue= in_testcoef[2,4],
+                      metric = "Relative Risk")
+  }
+  return(out)
+}
+
+
+##############
+
+##############
+#UPDATED: Tom#
+coefSmry_cox <- function(fit,tp,eventLBL){
+  
+  out <- fit %>%  
+  tidy(conf.int = TRUE, exponentiate = TRUE) %>% 
+  select(estimate, starts_with("conf"),p.value)
+  
+  out <- out %>% mutate(event=eventLBL, metric = "Hazard ratio")
+  
+  if (tp=="pre-omicron"){
+    out <- out %>% 
+      rename(po_estimate=estimate,po_conf_low=conf.low,po_conf_high=conf.high,po_pvalue=p.value)
+} else {
+    out <- out %>% 
+      rename(o_estimate=estimate,o_conf_low=conf.low,o_conf_high=conf.high,o_pvalue=p.value)
+}
+  
+  return(out)
+}
+##############
+
+pre_omicron <- covid_data_simulation_matched2 %>% filter(cov_grp==0)
+post_omicron <- covid_data_simulation_matched2 %>% filter(cov_grp==1)
+
+```
+
+### Adjusted RR Function ###
+```{r}
+adjRR <- function(indata,omicrongrp,outcome,coefs,dsc) {
+  
+   if (omicrongrp=="pre-omicron"){
+    dsn <- indata %>% filter(cov_grp==0)
+  } else {
+    dsn <- indata %>% filter(cov_grp==1)
+  }
+  
+  
+  f <- as.formula(
+  paste(outcome, 
+        paste(coefs, collapse = " + "), 
+        sep = " ~ "))
+  
+  mod = glm(f,
+            data =dsn, family = poisson(link = "log"))
+  
+  fit <- cbind(coeftest(mod, vcov = vcovHC(mod, type = "HC0")), coefci(mod, vcov = vcovHC(mod, type = "HC0"), level = 0.95))
+  
+  adjRRout = coefSmry.glmbinomial(fit,omicrongrp,paste0(dsc," (Relative Risk)"))
+}
+```
+
+### Adjusted RR Function ###
+```{r}
+# Define coefficient sets
+cov1 <- c("case","maxO2device_none","maxO2device_nc")
+cov2 <- c("case","maxO2device_none","maxO2device_nc","covVaxEver","covVaxLast4months","covVaxCumSum","maxTemp","maxALT")
+cov3 <- c("case","maxO2device_none","maxO2device_nc","covVaxEver","covVaxLast4months","covVaxCumSum","maxTemp","maxALT",
+          "elix_DIAB","elix_RENLFL","ccsr_cat_prefix_INF","ccsr_cat_prefix_INJ","ccsr_cat_prefix_RSP","minSODIUM","minPLT","maxWBC")
+cov4 <- c("case","covVaxCumSum")
+```
+
+### New admission to ICU After Match Day (RR) ###
+```{r}
+new_events_icu <- covid_data_simulation_matched %>% 
+  rename(event_flg=after_match_new_icu)
+
+new_icu_RR <- adjRR(new_events_icu,"pre-omicron","event_flg",cov1,"New admission to ICU After Match Day")
+
+new_icu_RR2 <- adjRR(new_events_icu,"pre-omicron","event_flg",cov2,"New admission to ICU After Match Day")
+
+new_icu_RR3 <- adjRR(new_events_icu,"pre-omicron","event_flg",cov3,"New admission to ICU After Match Day")
+
+new_icu_RR4 <- adjRR(new_events_icu,"omicron","event_flg",cov4,"New admission to ICU After Match Day")
+```
+
+
+### New Need for High Flow O2 After Match Day (RR) ###
+```{r}
+
+new_events_HF <- covid_data_simulation_matched %>% 
+  rename(event_flg=after_match_new_hf)
+
+new_hf_RR <- adjRR(new_events_HF,"pre-omicron","event_flg",cov1,"New Need for High Flow O2 After Match Day")
+
+new_hf_RR2 <- adjRR(new_events_HF,"pre-omicron","event_flg",cov2,"New Need for High Flow O2 After Match Day")
+
+new_hf_RR3 <- adjRR(new_events_HF,"pre-omicron","event_flg",cov3,"New Need for High Flow O2 After Match Day")
+
+new_hf_RR4 <- adjRR(new_events_HF,"omicron","event_flg",cov4,"New Need for High Flow O2 After Match Day")
+```
+
+
+
+### New Need for BIPAP After Match Day (RR) ###
+```{r}
+new_events_BIPAP <- covid_data_simulation_matched %>% 
+  rename(event_flg=after_match_new_bipap)
+  
+new_bipap_RR <- adjRR(new_events_BIPAP,"pre-omicron","event_flg",cov1,"New Need for BIPAP After Match Day")
+
+new_bipap_RR2 <- adjRR(new_events_BIPAP,"pre-omicron","event_flg",cov2,"New Need for BIPAP After Match Day")
+
+new_bipap_RR3 <- adjRR(new_events_BIPAP,"pre-omicron","event_flg",cov3,"New Need for BIPAP After Match Day")
+
+new_bipap_RR4 <- adjRR(new_events_BIPAP,"omicron","event_flg",cov4,"New Need for BIPAP After Match Day")
+```
+
+
+
+### New Need for Mechanical Ventilation After Match Day (RR) ###
+```{r}
+new_events_VENT <- covid_data_simulation_matched %>% 
+  rename(event_flg=after_match_new_vent)
+
+new_vent_RR <- adjRR(new_events_VENT,"pre-omicron","event_flg",cov1,"New Need for Mechanical Ventilation After Match Day Match Day")
+
+new_vent_RR2 <- adjRR(new_events_VENT,"pre-omicron","event_flg",cov2,"New Need for Mechanical Ventilation After Match Day Match Day")
+
+new_vent_RR3 <- adjRR(new_events_VENT,"pre-omicron","event_flg",cov3,"New Need for Mechanical Ventilation After Match Day Match Day")
+
+new_vent_RR4 <- adjRR(new_events_VENT,"omicron","event_flg",cov4,"New Need for Mechanical Ventilation After Match Day Match Day")
+```
+
+
+### New Need for High Flow O2, BIPAP, Or Mechanical Ventilation After Match Day (RR) ###
+```{r}
+new_events_O2 <- covid_data_simulation_matched %>% 
+  rename(event_flg=after_match_new_hfbipapvent)
+
+new_o2_RR <- adjRR(new_events_O2,"pre-omicron","event_flg",cov1,"New Need for High Flow O2, BIPAP, Or Mechanical Ventilation After Match Day")
+
+new_o2_RR2 <- adjRR(new_events_O2,"pre-omicron","event_flg",cov2,"New Need for High Flow O2, BIPAP, Or Mechanical Ventilation After Match Day")
+
+new_o2_RR3 <- adjRR(new_events_O2,"pre-omicron","event_flg",cov3,"New Need for High Flow O2, BIPAP, Or Mechanical Ventilation After Match Day")
+
+new_o2_RR4 <- adjRR(new_events_O2,"omicron","event_flg",cov4,"New Need for High Flow O2, BIPAP, Or Mechanical Ventilation After Match Day")
+```
+
+### Difference Function ###
+```{r}
+difference <- function(dsn,omicrongrp,type,outcome,coefs,dsc) {
+  
+  # Pre-Omicron
+  f <- as.formula(
+    paste(outcome,
+          paste(coefs, collapse = " + "),
+          sep = " ~ "))
+  
+  mydata = dsn
+  
+  if (type=="meandiff"){
+    
+    M <- lm(f, data = dsn)
+  
+    testcoef = cbind(coeftest(M, vcov = vcovCL, cluster = ~matchid),coefci(M, vcov = vcovCL, cluster = ~matchid))
+    testcoef
+  
+    ##############
+    #UPDATED: Tom#
+    md_po <-coefSmry.lm(testcoef,omicrongrp,dsc)
+    ##############
+  }else {
+    
+    M <- rq(f, data = mydata)
+    myboot = boot.rq(model.matrix(f, data = mydata), model.frame(f, data = mydata)[,1], R = 1e4)
+    myconfint = t(apply(myboot$B, 2, quantile, c(0.025,0.975)))
+    testcoef = cbind(summary(M, se = "ker")$coef, myconfint)
+    
+    md_po <- coefSmry.lm.med(testcoef,omicrongrp,paste0(dsc," Median Difference"))
+  }
+  
+
+  
+
+}
+```
+
+```{r}
+### Days from Match Day to Discharge ###
+covid_data_simulation_matched3 <- pre_omicron %>% 
+    mutate(match_to_discharge_days= as.numeric(dischargeDT-date)+1)
+
+mtd = difference(covid_data_simulation_matched3,"pre-omicron", "meandiff","match_to_discharge_days",cov1,"Days from Match Day to Discharge")
+
+mtd_med = difference(covid_data_simulation_matched3,"pre-omicron", "mediandiff","match_to_discharge_days",cov1,"Days from Match Day to Discharge")
+
+mtd2 = difference(covid_data_simulation_matched3,"pre-omicron", "meandiff","match_to_discharge_days",cov2,"Days from Match Day to Discharge")
+
+mtd_med2 = difference(covid_data_simulation_matched3,"pre-omicron", "mediandiff","match_to_discharge_days",cov2,"Days from Match Day to Discharge")
+
+mtd3 = difference(covid_data_simulation_matched3,"pre-omicron", "meandiff","match_to_discharge_days",cov3,"Days from Match Day to Discharge")
+
+mtd_med3 = difference(covid_data_simulation_matched3,"pre-omicron", "mediandiff","match_to_discharge_days",cov3,"Days from Match Day to Discharge")
+
+covid_data_simulation_matched3 <- post_omicron %>% 
+    mutate(match_to_discharge_days= as.numeric(dischargeDT-date)+1)
+
+mtd4 = difference(covid_data_simulation_matched3,"omicron", "meandiff","match_to_discharge_days",cov4,"Days from Match Day to Discharge")
+
+mtd_med4 = difference(covid_data_simulation_matched3,"omicron", "mediandiff","match_to_discharge_days",cov4,"Days from Match Day to Discharge")
+```
+
+### Hospital Length of Stay ###
+```{r}
+los = difference(pre_omicron,"pre-omicron", "meandiff","LOS",cov1,"Hospital Length of Stay")
+
+los_med = difference(pre_omicron,"pre-omicron", "mediandiff","LOS",cov1,"Hospital Length of Stay")
+
+los2 = difference(pre_omicron,"pre-omicron", "meandiff","LOS",cov2,"Hospital Length of Stay")
+
+los_med2 = difference(pre_omicron,"pre-omicron", "mediandiff","LOS",cov2,"Hospital Length of Stay")
+
+los3 = difference(pre_omicron,"pre-omicron", "meandiff","LOS",cov3,"Hospital Length of Stay")
+
+los_med3 = difference(pre_omicron,"pre-omicron", "mediandiff","LOS",cov3,"Hospital Length of Stay")
+
+los4 = difference(post_omicron,"omicron", "meandiff","LOS",cov4,"Hospital Length of Stay")
+
+los_med4 = difference(post_omicron,"omicron", "mediandiff","LOS",cov4,"Hospital Length of Stay")
+```
+
+
+### Hospital Length of Stay (Survivors Only) ###
+```{r}
+# Pre-Omicron
+pre_omicron_surv <- pre_omicron %>% filter(encDeathDerived==0)
+
+los_survivors = difference(pre_omicron_surv,"pre-omicron", "meandiff","LOS",cov1,"Hospital Length of Stay (Survivors Only)")
+
+los_survivors_med = difference(pre_omicron_surv,"pre-omicron", "mediandiff","LOS",cov1,"Hospital Length of Stay (Survivors Only)")
+
+los_survivors2 = difference(pre_omicron_surv,"pre-omicron", "meandiff","LOS",cov2,"Hospital Length of Stay (Survivors Only)")
+
+los_survivors_med2 = difference(pre_omicron_surv,"pre-omicron", "mediandiff","LOS",cov2,"Hospital Length of Stay (Survivors Only)")
+
+los_survivors3 = difference(pre_omicron_surv,"pre-omicron", "meandiff","LOS",cov3,"Hospital Length of Stay (Survivors Only)")
+
+los_survivors_med3 = difference(pre_omicron_surv,"pre-omicron", "mediandiff","LOS",cov3,"Hospital Length of Stay (Survivors Only)")
+
+post_omicron_surv <- post_omicron %>% filter(encDeathDerived==0)
+
+los_survivors4 = difference(post_omicron_surv,"omicron", "meandiff","LOS",cov4,"Hospital Length of Stay (Survivors Only)")
+
+los_survivors_med4 = difference(post_omicron_surv,"omicron", "mediandiff","LOS",cov4,"Hospital Length of Stay (Survivors Only)")
+```
+
+
+
+### Discharge to Home (RR) ###
+```{r}
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==0)
+
+dc_home_RR <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_home",cov1,"Discharge to Home")
+
+dc_home_RR2 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_home",cov2,"Discharge to Home")
+
+dc_home_RR3 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_home",cov3,"Discharge to Home")
+
+dc_home_RR4 <- adjRR(post_omicron,"omicron","discharge_home",cov4,"Discharge to Home")
+```
+
+
+### Discharge to Rehab (RR) ###
+```{r}
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==0)
+
+dc_rehab_RR <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_rehab",cov1,"Discharge to Rehab")
+
+dc_rehab_RR2 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_rehab",cov2,"Discharge to Rehab")
+
+dc_rehab_RR3 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_rehab",cov3,"Discharge to Rehab")
+
+dc_rehab_RR4 <- adjRR(post_omicron,"omicron","discharge_rehab",cov4,"Discharge to Rehab")
+```
+
+
+### Discharge to SNF (RR) ###
+```{r}
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==0)
+
+dc_snf_RR <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_snf",cov1,"Discharge to SNF")
+
+dc_snf_RR2 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_snf",cov2,"Discharge to SNF")
+
+dc_snf_RR3 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_snf",cov3,"Discharge to SNF")
+
+dc_snf_RR4 <- adjRR(post_omicron,"omicron","discharge_snf",cov4,"Discharge to SNF")
+```
+
+
+### Discharge to Hospice (RR) ###
+```{r}
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==0)
+
+dc_hospice_RR <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_hospice",cov1,"Discharge to Hospice")
+
+dc_hospice_RR2 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_hospice",cov2,"Discharge to Hospice")
+
+dc_hospice_RR3 <- adjRR(covid_data_simulation_matched3,"pre-omicron","discharge_hospice",cov3,"Discharge to Hospice")
+
+dc_hospice_RR4 <- adjRR(post_omicron,"omicron","discharge_hospice",cov4,"Discharge to Hospice")
+```
+
+### Subdistributional Hazard Function ###
+```{r}
+subdisthazard <- function(dsn,omicrongrp,coefs,dsc) {
+  
+  outcome <- "Surv(LOS, dd2)"
+  
+  f <- as.formula(
+    paste(outcome,
+          paste(coefs, collapse = " + "),
+          sep = " ~ "))
+  
+  # Code does not work when using etype
+  # It looks like the default for finegray is to use the first value
+  subdistdat = finegray(f, 
+                        data=dsn)
+  
+  outcome <- "Surv(fgstart, fgstop, fgstatus)"
+  
+  f <- as.formula(
+    paste(outcome,
+          paste(coefs, collapse = " + "),
+          sep = " ~ "))
+  
+  fgfit <- coxph(f,
+                 weight=fgwt, data=subdistdat)
+  
+  sh <- coefSmry_cox(fgfit,omicrongrp,paste0(dsc," - Subdistributional Hazard")) %>% 
+    # row 1 is for case; every coefficient will have a row, only want to report case
+    filter(row_number()==1)
+  
+  return(sh)
+}
+```
+
+### Discharge to Hospice - Subdistributional Hazard ###
+```{r}
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% 
+  mutate(
+    dd2 = case_when(
+      dischargeDispositionGroup2=="Hospice" ~ 1,
+      dischargeDispositionGroup2=="Rehabilitation facility" ~ 2,
+      dischargeDispositionGroup2=="Skilled nursing facility" ~ 3,
+      dischargeDispositionGroup2=="Other" ~ 4,
+      dischargeDispositionGroup2=="Death" ~ 5,
+      dischargeDispositionGroup2=="Home" ~ 6,
+      ),
+    dd2 = factor(dd2, levels = c(0,1,2,3,4,5,6),
+                              labels = c("Nothing","Hospice","Rehabilitation facility","Skilled nursing facility","Other","Death","Home")))
+  
+str(covid_data_simulation_matched3$dd2)
+  
+covid_data_simulation_matched3 %>% ungroup() %>% select(dd2) %>% sapply(levels)
+  
+  
+# Pre-Omicron
+po <- covid_data_simulation_matched3 %>% filter(cov_grp==0)
+  
+ 
+hospice_sh <- subdisthazard(po,"pre-omicron",cov1,"Discharge to Hospice")
+
+hospice_sh2 <- subdisthazard(po,"pre-omicron",cov2,"Discharge to Hospice")
+
+hospice_sh3 <- subdisthazard(po,"pre-omicron",cov3,"Discharge to Hospice")
+
+o <- covid_data_simulation_matched3 %>% filter(cov_grp==1)
+
+hospice_sh4 <- subdisthazard(o,"omicron",cov4,"Discharge to Hospice")
+```
+
+
+### Discharge to Hospice or Death - Subdistributional Hazard ###
+```{r}
+
+  covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% 
+    mutate(
+           dd2 = case_when(
+             encDeathDerived==1 | dischargeDispositionGroup2=="Death" | dischargeDispositionGroup2=="Hospice" ~ 1,
+             dischargeDispositionGroup2=="Rehabilitation facility" ~ 2,
+             dischargeDispositionGroup2=="Skilled nursing facility" ~ 3,
+             dischargeDispositionGroup2=="Other" ~ 4,
+             dischargeDispositionGroup2== "Home" ~ 5,
+           ),
+           
+           dd2 = factor(dd2, levels = c(0,1,2,3,4,5),
+                              labels = c("Nothing","Death/Hospice","Rehabilitation facility","Skilled nursing facility","Other","Home")))
+  
+  str(covid_data_simulation_matched3$dd2)
+  
+  covid_data_simulation_matched3 %>% ungroup() %>% select(dd2) %>% sapply(levels)
+  
+  # Pre-Omicron
+  po <- covid_data_simulation_matched3 %>% filter(cov_grp==0)
+  
+
+deathhospice_sh <- subdisthazard(po,"pre-omicron",cov1,"Discharge to Hospice or Death")
+
+deathhospice_sh2 <- subdisthazard(po,"pre-omicron",cov2,"Discharge to Hospice or Death")
+
+deathhospice_sh3 <- subdisthazard(po,"pre-omicron",cov3,"Discharge to Hospice or Death")
+
+o <- covid_data_simulation_matched3 %>% filter(cov_grp==1)
+
+deathhospice_sh4 <- subdisthazard(o,"omicron",cov4,"Discharge to Hospice or Death")
+```
+
+
+### Discharged Alive (Home, SNF, Rehab, Hospice, Other) - Subdistributional Hazard ###
+```{r}
+
+  covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% 
+    mutate(
+           dd2 = case_when(
+             dischargeDispositionGroup2=="Home" | dischargeDispositionGroup2=="Hospice" | dischargeDispositionGroup2=="Rehabilitation facility" | dischargeDispositionGroup2=="Skilled nursing facility" | dischargeDispositionGroup2=="Other" ~ 1,
+             dischargeDispositionGroup2=="Death" ~ 2
+           ),
+           
+           dd2 = factor(dd2, levels = c(0,1,2),
+                              labels = c("Nothing","Discharged Alive","Death")))
+  
+  str(covid_data_simulation_matched3$dd2)
+  
+  covid_data_simulation_matched3 %>% ungroup() %>% select(dd2) %>% sapply(levels)
+  
+  # Pre-Omicron
+  po <- covid_data_simulation_matched3 %>% filter(cov_grp==0)
+  
+ 
+dcalive_sh <- subdisthazard(po,"pre-omicron",cov1,"Discharged Alive (Home, SNF, Rehab, Hospice, Other)")
+
+dcalive_sh2 <- subdisthazard(po,"pre-omicron",cov2,"Discharged Alive (Home, SNF, Rehab, Hospice, Other)")
+
+dcalive_sh3 <- subdisthazard(po,"pre-omicron",cov3,"Discharged Alive (Home, SNF, Rehab, Hospice, Other)")
+
+
+o <- covid_data_simulation_matched3 %>% filter(cov_grp==1)
+
+dcalive_sh4 <- subdisthazard(o,"omicron",cov4,"Discharged Alive (Home, SNF, Rehab, Hospice, Other)")
+```
+
+### Discharged Alive (Home, SNF, Rehab, Other) - Subdistributional Hazard ###
+```{r}
+
+  covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% 
+    mutate(
+           dd2 = case_when(
+             dischargeDispositionGroup2=="Home" | dischargeDispositionGroup2=="Rehabilitation facility" | dischargeDispositionGroup2=="Skilled nursing facility" | dischargeDispositionGroup2=="Other" ~ 1,
+             dischargeDispositionGroup2=="Death" ~ 2,
+             dischargeDispositionGroup2=="Hospice" ~ 3
+           ),
+           
+           dd2 = factor(dd2, levels = c(0,1,2,3),
+                              labels = c("Nothing","Discharged Alive","Death","Hospice")))
+  
+  str(covid_data_simulation_matched3$dd2)
+  
+  covid_data_simulation_matched3 %>% ungroup() %>% select(dd2) %>% sapply(levels)
+  
+  # Pre-Omicron
+  po <- covid_data_simulation_matched3 %>% filter(cov_grp==0)
+  
+  
+
+dcalive2_sh <- subdisthazard(po,"pre-omicron",cov1,"Discharged Alive (Home, SNF, Rehab, Other)")
+
+dcalive2_sh2 <- subdisthazard(po,"pre-omicron",cov2,"Discharged Alive (Home, SNF, Rehab, Other)")
+
+dcalive2_sh3 <- subdisthazard(po,"pre-omicron",cov3,"Discharged Alive (Home, SNF, Rehab, Other)")
+
+o <- covid_data_simulation_matched3 %>% filter(cov_grp==1)
+
+dcalive2_sh4 <- subdisthazard(o,"omicron",cov4,"Discharged Alive (Home, SNF, Rehab, Other)")
+```
+
+### Discharged To Facility (SNF, Rehab, Hospice) - Subdistributional Hazard ###
+```{r}
+  covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% 
+    mutate(
+           dd2 = case_when(
+              dischargeDispositionGroup2=="Rehabilitation facility" | dischargeDispositionGroup2=="Skilled nursing facility" | dischargeDispositionGroup2=="Hospice" ~ 1,
+             dischargeDispositionGroup2=="Death" ~ 2,
+             dischargeDispositionGroup2=="Home"  ~ 3,
+             dischargeDispositionGroup2=="Other" ~ 4
+           ),
+           
+           dd2 = factor(dd2, levels = c(0,1,2,3,4),
+                              labels = c("Nothing","Facility","Death","Home","Other")))
+  
+  str(covid_data_simulation_matched3$dd2)
+  
+  covid_data_simulation_matched3 %>% ungroup() %>% select(dd2) %>% sapply(levels)
+  
+  # Pre-Omicron
+  po <- covid_data_simulation_matched3 %>% filter(cov_grp==0)
+  
+
+
+dcfacility_sh <- subdisthazard(po,"pre-omicron",cov1,"Discharged To Facility (SNF, Rehab, Hospice)")
+
+dcfacility_sh2 <- subdisthazard(po,"pre-omicron",cov2,"Discharged To Facility (SNF, Rehab, Hospice)")
+
+dcfacility_sh3 <- subdisthazard(po,"pre-omicron",cov3,"Discharged To Facility (SNF, Rehab, Hospice)")
+
+o <- covid_data_simulation_matched3 %>% filter(cov_grp==1)
+
+dcfacility_sh4 <- subdisthazard(o,"omicron",cov4,"Discharged To Facility (SNF, Rehab, Hospice)")
+```
+
+
+### Hospital Death - Subdistributional Hazard ###
+```{r}
+
+  covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% 
+    mutate(dd2 = case_when(
+             encDeathDerived==1 | dischargeDispositionGroup2=="Death" ~ 1,
+             dischargeDispositionGroup2== "Home" ~ 2,
+             dischargeDispositionGroup2=="Rehabilitation facility" ~ 3,
+             dischargeDispositionGroup2=="Skilled nursing facility" ~ 4,
+             dischargeDispositionGroup2=="Other" ~ 5,
+             dischargeDispositionGroup2=="Hospice" ~ 6
+           ),
+           
+           dd2 = factor(dd2, levels = c(0,1,2,3,4,5,6),
+                              labels = c("Nothing","Death","Home","Rehabilitation facility","Skilled nursing facility","Other","Hospice")))
+  
+  str(covid_data_simulation_matched3$dd2)
+  
+  covid_data_simulation_matched3 %>% ungroup() %>% select(dd2) %>% sapply(levels)
+  
+  
+  # Pre-Omicron
+  po <- covid_data_simulation_matched3 %>% filter(cov_grp==0)
+  
+ 
+hospdeath_sh <-subdisthazard(po,"pre-omicron",cov1,"Hospital Death")
+
+hospdeath_sh2 <-subdisthazard(po,"pre-omicron",cov2,"Hospital Death")
+
+hospdeath_sh3 <-subdisthazard(po,"pre-omicron",cov3,"Hospital Death")
+
+o <- covid_data_simulation_matched3 %>% filter(cov_grp==1)
+
+hospdeath_sh4 <-subdisthazard(o,"omicron",cov4,"Hospital Death")
+```
+
+### Hospital Death (RR) ###
+```{r}
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==0) %>%  
+  mutate(dd2 = if_else(encDeathDerived==1 | dischargeDispositionGroup2=="Death", "Death",dischargeDispositionGroup2),
+         hospital_death= if_else(dd2=="Death",1,0))
+
+hospital_death_RR <- adjRR(covid_data_simulation_matched3,"pre-omicron","hospital_death",cov1,"Hospital Death")
+
+hospital_death_RR2 <- adjRR(covid_data_simulation_matched3,"pre-omicron","hospital_death",cov2,"Hospital Death")
+
+hospital_death_RR3 <- adjRR(covid_data_simulation_matched3,"pre-omicron","hospital_death",cov3,"Hospital Death")
+
+
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==1) %>%  
+  mutate(dd2 = if_else(encDeathDerived==1 | dischargeDispositionGroup2=="Death", "Death",dischargeDispositionGroup2),
+         hospital_death= if_else(dd2=="Death",1,0))
+
+
+hospital_death_RR4 <- adjRR(covid_data_simulation_matched3,"omicron","hospital_death",cov4,"Hospital Death")
+```
+
+
+### 30-day Mortality counting from match day (RR) ###
+```{r}
+max_admitDT <- max(covid_data_simulation$admitDT)
+
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==0) %>% 
+  # only look at hospitalization that could have data 30 days post discharge
+  # filter(dischargeDT<=max_admitDT-30) %>% 
+  mutate(deathDT_derived = date(deathDTS_derived),
+         match_to_death_days = as.numeric((deathDT_derived - date) +1),
+         death30day = if_else(!is.na(match_to_death_days) & match_to_death_days <= 30, 1, 0))
+
+# N cases after filtering
+nrow(covid_data_simulation_matched3 %>% filter(case==1))
+
+
+death30day <- adjRR(covid_data_simulation_matched3,"pre-omicron","death30day",cov1,"30-day Mortality (counting from match day)")
+
+death30day2 <- adjRR(covid_data_simulation_matched3,"pre-omicron","death30day",cov2,"30-day Mortality (counting from match day)")
+
+death30day3 <- adjRR(covid_data_simulation_matched3,"pre-omicron","death30day",cov3,"30-day Mortality (counting from match day)")
+
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==1) %>% 
+  # only look at hospitalization that could have data 30 days post discharge
+  # filter(dischargeDT<=max_admitDT-30) %>% 
+  mutate(deathDT_derived = date(deathDTS_derived),
+         match_to_death_days = as.numeric((deathDT_derived - date) +1),
+         death30day = if_else(!is.na(match_to_death_days) & match_to_death_days <= 30, 1, 0))
+
+death30day4 <- adjRR(covid_data_simulation_matched3,"omicron","death30day",cov4,"30-day Mortality (counting from match day)")
+```
+
+
+### 30-day Readmission counting from match day (RR) ###
+```{r}
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==0) %>%  
+  # only look at hospitalization that could have data 30 days post discharge
+  # filter(dischargeDT<=max_admitDT-30) %>% 
+  mutate(nextAdmitDT = date(nextAdmitDTS),
+         match_to_next_admit_days = as.numeric((nextAdmitDT - date)+1),
+         readmit30day = if_else(!is.na(match_to_next_admit_days) & match_to_next_admit_days <= 30, 1, 0))
+
+# N cases after filtering
+print(nrow(covid_data_simulation_matched3 %>% filter(case==1)))
+
+readmit30day <- adjRR(covid_data_simulation_matched3,"pre-omicron","readmit30day",cov1,"30-day Readmission (counting from match day)")
+
+readmit30day2 <- adjRR(covid_data_simulation_matched3,"pre-omicron","readmit30day",cov2,"30-day Readmission (counting from match day)")
+
+readmit30day3 <- adjRR(covid_data_simulation_matched3,"pre-omicron","readmit30day",cov3,"30-day Readmission (counting from match day)")
+
+covid_data_simulation_matched3 <- covid_data_simulation_matched2 %>% filter(cov_grp==1) %>%  
+  # only look at hospitalization that could have data 30 days post discharge
+  # filter(dischargeDT<=max_admitDT-30) %>% 
+  mutate(nextAdmitDT = date(nextAdmitDTS),
+         match_to_next_admit_days = as.numeric((nextAdmitDT - date)+1),
+         readmit30day = if_else(!is.na(match_to_next_admit_days) & match_to_next_admit_days <= 30, 1, 0))
+
+readmit30day4 <- adjRR(covid_data_simulation_matched3,"omicron","readmit30day",cov4,"30-day Readmission (counting from match day)")
+```
+
+### 30d hospital-free days (counting from match day) ###
+```{r}
+hfd = difference(pre_omicron,"pre-omicron","meandiff","hospitalfree30day",cov1,"30d Hospital-Free Days")
+
+hfd_med = difference(pre_omicron,"pre-omicron","mediandiff","hospitalfree30day",cov1,"30d Hospital-Free Days")
+
+hfd2 = difference(pre_omicron,"pre-omicron","meandiff","hospitalfree30day",cov2,"30d Hospital-Free Days")
+
+hfd_med2 = difference(pre_omicron,"pre-omicron","mediandiff","hospitalfree30day",cov2,"30d Hospital-Free Days")
+
+hfd3 = difference(pre_omicron,"pre-omicron","meandiff","hospitalfree30day",cov3,"30d Hospital-Free Days")
+
+hfd_med3 = difference(pre_omicron,"pre-omicron","mediandiff","hospitalfree30day",cov3,"30d Hospital-Free Days")
+
+hfd4 = difference(post_omicron,"omicron","meandiff","hospitalfree30day",cov4,"30d Hospital-Free Days")
+
+hfd_med4 = difference(post_omicron,"omicron","mediandiff","hospitalfree30day",cov4,"30d Hospital-Free Days")
+```
+
+
+
+### Outcome Summary ###
+```{r}
+
+# 4/20/24 adjusted subdistributional hazard ratios will report coefficients for all covariates. Only want values corresponding to case (first row)
+os  <- bind_rows(new_icu_RR,new_hf_RR,new_bipap_RR,new_vent_RR,new_o2_RR,
+                 mtd,mtd_med,los,los_med,los_survivors,los_survivors_med,
+                 dc_home_RR,dc_rehab_RR,dc_snf_RR,dc_hospice_RR,hospice_sh,deathhospice_sh,
+                   dcalive_sh,dcalive2_sh,dcfacility_sh,hospital_death_RR,hospdeath_sh,
+                   death30day,readmit30day,hfd,hfd_med) %>% select(event,everything())
+
+write.csv(os,file = file.path(outLoc,paste0("outcomes_",outfilesfx,"-1.csv")))
+
+
+kable(os,
+      digits = c(2,2, 2, 2,3,2, 2, 2,3),
+      format.args = list(scientific = FALSE))
+
+os2  <- bind_rows(new_icu_RR2,new_hf_RR2,new_bipap_RR2,new_vent_RR2,new_o2_RR2,
+                 mtd2,mtd_med2,los2,los_med2,los_survivors2,los_survivors_med2,
+                 dc_home_RR2,dc_rehab_RR2,dc_snf_RR2,dc_hospice_RR2,hospice_sh2,deathhospice_sh2,
+                   dcalive_sh2,dcalive2_sh2,dcfacility_sh2,hospital_death_RR2,hospdeath_sh2,
+                   death30day2,readmit30day2,hfd2,hfd_med2) %>% select(event,everything())
+
+write.csv(os2,file = file.path(outLoc,paste0("outcomes_",outfilesfx,"-2.csv")))
+
+
+kable(os2,
+      digits = c(2,2, 2, 2,3,2, 2, 2,3),
+      format.args = list(scientific = FALSE))
+
+os3  <- bind_rows(new_icu_RR3,new_hf_RR3,new_bipap_RR3,new_vent_RR3,new_o2_RR3,
+                 mtd3,mtd_med3,los3,los_med3,los_survivors3,los_survivors_med3,
+                 dc_home_RR3,dc_rehab_RR3,dc_snf_RR3,dc_hospice_RR3,hospice_sh3,deathhospice_sh3,
+                   dcalive_sh3,dcalive2_sh3,dcfacility_sh3,hospital_death_RR3,hospdeath_sh3,
+                   death30day3,readmit30day3,hfd3,hfd_med3) %>% select(event,everything())
+
+write.csv(os3,file = file.path(outLoc,paste0("outcomes_",outfilesfx,"-3.csv")))
+
+
+kable(os3,
+      digits = c(2,2, 2, 2,3,2, 2, 2,3),
+      format.args = list(scientific = FALSE))
+
+os4  <- bind_rows(new_icu_RR4,new_hf_RR4,new_bipap_RR4,new_vent_RR4,new_o2_RR4,
+                 mtd4,mtd_med4,los4,los_med4,los_survivors4,los_survivors_med4,
+                 dc_home_RR4,dc_rehab_RR4,dc_snf_RR4,dc_hospice_RR4,hospice_sh4,deathhospice_sh4,
+                   dcalive_sh4,dcalive2_sh4,dcfacility_sh4,hospital_death_RR4,hospdeath_sh4,
+                   death30day4,readmit30day4,hfd4,hfd_med4) %>% select(event,everything())
+
+write.csv(os4,file = file.path(outLoc,paste0("outcomes_",outfilesfx,"-4.csv")))
+
+
+kable(os4,
+      digits = c(2,2, 2, 2,3,2, 2, 2,3),
+      format.args = list(scientific = FALSE))
+
+```
+
